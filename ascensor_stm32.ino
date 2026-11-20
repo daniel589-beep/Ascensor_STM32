@@ -1,50 +1,95 @@
+/*
+  ASCENSOR 3 PISOS - STM32F411 Black Pill (core STM32duino, Arduino IDE / VS Code)
+
+  - Motor 28BYJ-48: movimiento por PASOS (sin sensores). NO MODIFICADO.
+  - Servo SG90 (puerta): estado inicial ABIERTA (brazo al norte). Cierra antes de moverse y
+    abre al llegar. Cerrada = brazo al oeste (~80 grados). (Logica de servo de la version que funcionaba)
+  - Sensores TCRT5000: se leen (irLeer) pero el LCD muestra el piso segun los PASOS.
+  - LEDs: verde = reposo, amarillo = en movimiento, rojo = emergencia.
+  - LCD 16x2 I2C: "Piso -" al pulsar un boton y mientras se mueve; al frenar muestra el piso
+    que corresponde a los pasos.
+
+  NOVEDADES DE ESTA VERSION
+  1) Emergencia: al liberarla (2a pulsacion) el ascensor RETOMA el destino que tenia antes de
+     la emergencia. Las llamadas pendientes ya no se borran.
+  2) Prioridad por cercania: se atiende primero el piso solicitado mas CERCANO.
+     Desempate (ej: en piso 2 con llamadas 1 y 3): gana el que siga el sentido de la ultima
+     marcha (llego subiendo -> va al 3, llego bajando -> va al 1).
+  3) SERVO: vuelve a la logica original que funcionaba (pulso directo, 660 us, 600 ms).
+
+  MODO_SERVO 1   -> herramienta para CALIBRAR los pulsos del servo (P1 menos / P2 mas).
+  MODO_PRUEBA 0  -> CALIBRACION de pasos entre pisos (como antes).
+  MODO_PRUEBA 1  -> ASCENSOR normal.
+
+  PINES
+    Pulsadores (a GND, pull-up interno): P1 = PA1, P2 = PA2, P3 = PA3, EMERGENCIA = PA4
+    Motor ULN2003 IN1..IN4:              PB12, PB13, PB14, PB15
+    LCD I2C:                             SDA = PB7, SCL = PB6
+    Servo SG90 (senal naranja):          PA8 (TIM1_CH1, PWM 50 Hz)
+    Sensores IR TCRT5000 (DO):           PA5 (piso 1), PA6 (piso 2), PA7 (piso 3)
+    LEDs (con 220 ohm a GND):            PB8 verde (reposo), PB9 amarillo (movimiento), PB10 rojo (emergencia)
+*/
 #include <Arduino.h>
 #include <Wire.h>
-#include <Servo.h>
 
-#define MODO_SERVO         0
-#define MODO_PRUEBA        1
-#define USAR_SERIAL        0
+/* ================= CONFIGURACION ================= */
+#define MODO_SERVO         0        /* 1 = calibrar servo (ver arriba) */
+#define MODO_PRUEBA        1        /* 0 = calibrar pasos, 1 = ascensor */
+#define USAR_SERIAL        0        /* 1 = tambien imprime por Serial */
 
-#define SENTIDO_SUBIDA     1
-#define T_PASO_US          2000UL
-#define RAMP_PASOS         150
-#define RAMP_INC_US        10UL
-#define LIMITE_PASOS       120000L
-#define PASOS_POR_VUELTA   4096.0f
-#define DEB_MS             30
-#define LARGO_MS           2000
-#define PASOS_LLEGANDO     3000
+#define SENTIDO_SUBIDA     1        /* pon -1 si al pulsar SUBIR la cabina baja */
+#define T_PASO_US          2000UL   /* us entre pasos a velocidad normal (2 ms). Sube a 3000 si pierde pasos */
+#define RAMP_PASOS         150      /* pasos de arranque/frenado suave (modo prueba) */
+#define RAMP_INC_US        10UL     /* cuanto mas lento por cada paso de rampa */
+#define LIMITE_PASOS       120000L  /* tope de seguridad en calibracion (|pos| maximo) */
+#define PASOS_POR_VUELTA   4096.0f  /* 28BYJ-48 en medio paso */
+#define DEB_MS             30       /* antirrebote */
+#define LARGO_MS           2000     /* pulsacion larga de P3 */
+#define PASOS_LLEGANDO     3000     /* en los ultimos pasos del viaje el LCD muestra "Llegando" */
 
-static const int32_t PASOS_PISO[4] = {0, 0, 21500, 41525};
+/* Pasos medidos (indice 1..3). Piso 1 = 0. */
+static const int32_t PASOS_PISO[4] = {0, 0, 21500, 41525};   /* piso1=0, piso2=21500, piso3=41525 */
 
+/* ---- Servo de la puerta ----
+   SG90: ~10.5 us por grado. Abierta = brazo al NORTE. Cerrada = brazo al OESTE (~80 grados).
+   CALIBRA con MODO_SERVO 1: primero ajusta SERVO_ABIERTO_US hasta que el brazo apunte al norte,
+   luego encuentra el pulso donde apunta al oeste y ponlo en SERVO_CERRADO_US.
+   Si al cerrar gira hacia el ESTE en vez del oeste, cambia SERVO_CERRADO_US a 2340 (ABIERTO + 840). */
 #define SERVO_ABIERTO_US   1500
 #define SERVO_CERRADO_US   660
-#define SERVO_CON_LIBRERIA 1
-#define T_SERVO_MS         600
-#define T_LLEGANDO_MS      1000
-#define T_PUERTA_ABIERTA_MS 3000
-
+#define SERVO_CON_LIBRERIA 0        /* 0 = PWM por hardware TIM1 (pulso limpio), 1 = libreria Servo */
+#define T_SERVO_MS         600      /* tiempo para que el servo llegue */
+#define T_LLEGANDO_MS      1000     /* la puerta abre 1 s DESPUES de parar en el piso */
+#define T_PUERTA_ABIERTA_MS 3000    /* solo si PUERTA_ABIERTA_EN_REPOSO = 0 */
+/* 1 = la puerta queda ABIERTA en reposo y solo se cierra cuando hay que moverse (estado inicial abierta)
+   0 = despues de 3 s abierta, se cierra sola (como pide el PDF del proyecto) */
 #define PUERTA_ABIERTA_EN_REPOSO 1
 
-#define SENSOR_ACTIVO      LOW
-#define IR_FILTRO_MS       20
+/* ---- Sensores IR ---- */
+#define SENSOR_ACTIVO      LOW      /* TCRT5000 con LM393: DO baja al detectar */
+#define IR_FILTRO_MS       20       /* el cambio debe durar 20 ms para aceptarse */
 
-#define MOSTRAR_PASOS      0
+#define MOSTRAR_PASOS      0        /* 1 = la fila 1 del LCD tambien muestra los pasos (para depurar) */
 
-static const uint32_t PIN_BTN[3] = {PA1, PA2, PA3};
+#if SERVO_CON_LIBRERIA
+#include <Servo.h>
+#endif
+
+/* ================= PINES ================= */
+static const uint32_t PIN_BTN[3] = {PA1, PA2, PA3};   /* P1, P2, P3 */
 #define PIN_EMG            PA4
-static const uint32_t PIN_MOTOR[4] = {PB12, PB13, PB14, PB15};
-
+static const uint32_t PIN_MOTOR[4] = {PB12, PB13, PB14, PB15};  /* IN1..IN4 */
+/* Las 4 bobinas deben ser 4 pines SEGUIDOS del mismo puerto (PB12..PB15) */
 #define COIL_PORT          GPIOB
 #define COIL_SHIFT         12
 
 #define PIN_SERVO          PA8
-static const uint32_t PIN_IR[3] = {PA5, PA6, PA7};
-#define PIN_LED_REPOSO     PB8
-#define PIN_LED_MOV        PB9
-#define PIN_LED_EMG        PB10
+static const uint32_t PIN_IR[3] = {PA5, PA6, PA7};    /* piso 1, 2, 3 */
+#define PIN_LED_REPOSO     PB8      /* verde    */
+#define PIN_LED_MOV        PB9      /* amarillo */
+#define PIN_LED_EMG        PB10     /* rojo     */
 
+/* Si USAR_SERIAL = 0, Serial se sustituye por un objeto vacio (no imprime ni bloquea) */
 #if !USAR_SERIAL
 struct NullSerial {
   template<class T> void print(T) {}
@@ -58,10 +103,11 @@ static NullSerial NullSer;
 #define Serial NullSer
 #endif
 
+/* ================= LCD I2C (PCF8574) ================= */
 static uint8_t lcdAddr = 0x27;
 static bool    lcdOk = false;
-static char    lcdDes[32];
-static char    lcdAct[32];
+static char    lcdDes[32];           /* lo que queremos mostrar */
+static char    lcdAct[32];           /* lo que la pantalla ya muestra */
 static int     lcdCur = -1;
 static char    msgTmp[17];
 static uint32_t msgFin = 0;
@@ -88,7 +134,7 @@ static void lcdEnviar(uint8_t val, uint8_t rs)
 
 static void lcdInit(void)
 {
-
+  /* Flechas personalizadas: codigo 1 = arriba, codigo 2 = abajo */
   static const uint8_t flechaArriba[8] = {0x04,0x0E,0x15,0x04,0x04,0x04,0x04,0x00};
   static const uint8_t flechaAbajo[8]  = {0x04,0x04,0x04,0x04,0x15,0x0E,0x04,0x00};
 
@@ -111,15 +157,15 @@ static void lcdInit(void)
   lcdNibble(0x30); delay(1);
   lcdNibble(0x30); delay(1);
   lcdNibble(0x20); delay(1);
-  lcdEnviar(0x28, 0); delay(1);
-  lcdEnviar(0x0C, 0); delay(1);
+  lcdEnviar(0x28, 0); delay(1);   /* 4 bits, 2 lineas */
+  lcdEnviar(0x0C, 0); delay(1);   /* display ON, sin cursor */
   lcdEnviar(0x06, 0); delay(1);
-  lcdEnviar(0x01, 0); delay(3);
+  lcdEnviar(0x01, 0); delay(3);   /* limpiar */
 
-  lcdEnviar(0x48, 0);
+  lcdEnviar(0x48, 0);             /* CGRAM, caracter 1 */
   for (uint8_t i = 0; i < 8; i++) lcdEnviar(flechaArriba[i], 1);
   for (uint8_t i = 0; i < 8; i++) lcdEnviar(flechaAbajo[i], 1);
-  lcdEnviar(0x80, 0);
+  lcdEnviar(0x80, 0);             /* volver a DDRAM */
 
   memset(lcdDes, ' ', sizeof(lcdDes));
   memset(lcdAct, ' ', sizeof(lcdAct));
@@ -133,6 +179,7 @@ static void lcdPoner(uint8_t fila, const char *txt)
   memcpy(&lcdDes[fila * 16], tmp, 16);
 }
 
+/* Manda como maximo UN caracter por llamada: el motor nunca se queda bloqueado */
 static void lcdPoll(void)
 {
   static uint8_t inicio = 0;
@@ -151,6 +198,7 @@ static void lcdPoll(void)
   }
 }
 
+/* Mensaje temporal en la fila 2 */
 static void lcdMensaje(const char *t, uint32_t ms)
 {
   strncpy(msgTmp, t, 16);
@@ -158,45 +206,87 @@ static void lcdMensaje(const char *t, uint32_t ms)
   msgFin = millis() + ms;
 }
 
-static bool puerta_abierta = true;
+/* ================= SERVO SG90 (puerta) ================= */
+/*
+   Control por posicion, igual que en el codigo de referencia:
+   - servoInit(): configura PWM de 50 Hz y manda la posicion ABIERTA.
+   - puerta_abrir()/puerta_cerrar(): mandan un pulso solo al cambiar de estado.
+   - El PWM permanece estable mientras el servo sostiene la posicion.
+*/
+static bool puerta_abierta = true;           /* servo inicializado en ABIERTA */
+static uint16_t servo_pulso_actual = SERVO_ABIERTO_US;
+
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 2500
+
+static uint16_t servoLimitarPulso(uint16_t us)
+{
+  if (us < SERVO_MIN_US) us = SERVO_MIN_US;
+  if (us > SERVO_MAX_US) us = SERVO_MAX_US;
+  return us;
+}
 
 #if SERVO_CON_LIBRERIA
 static Servo servoPuerta;
 
 static void servoInit(void)
 {
-  servoPuerta.attach(PIN_SERVO, 500, 2500);
-  servoPuerta.writeMicroseconds(SERVO_ABIERTO_US);
+  servo_pulso_actual = servoLimitarPulso(SERVO_ABIERTO_US);
+  servoPuerta.attach(PIN_SERVO, SERVO_MIN_US, SERVO_MAX_US);
+  servoPuerta.writeMicroseconds(servo_pulso_actual);
+  puerta_abierta = true;
 }
 
 static void servoUs(uint16_t us)
 {
+  us = servoLimitarPulso(us);
+  if (us == servo_pulso_actual) return;
   servoPuerta.writeMicroseconds(us);
+  servo_pulso_actual = us;
 }
 #else
 static HardwareTimer *servoTim = NULL;
 
 static void servoInit(void)
 {
+  servo_pulso_actual = servoLimitarPulso(SERVO_ABIERTO_US);
   servoTim = new HardwareTimer(TIM1);
+  if (servoTim == NULL) return;
+
   servoTim->setMode(1, TIMER_OUTPUT_COMPARE_PWM1, PIN_SERVO);
-  servoTim->setOverflow(20000, MICROSEC_FORMAT);
-  servoTim->setCaptureCompare(1, SERVO_ABIERTO_US, MICROSEC_COMPARE_FORMAT);
+  servoTim->setOverflow(20000, MICROSEC_FORMAT);  /* 20 ms = 50 Hz */
+  servoTim->setCaptureCompare(1, servo_pulso_actual, MICROSEC_COMPARE_FORMAT);
   servoTim->resume();
+  puerta_abierta = true;
 }
 
 static void servoUs(uint16_t us)
 {
+  us = servoLimitarPulso(us);
+  if (servoTim == NULL || us == servo_pulso_actual) return;
   servoTim->setCaptureCompare(1, us, MICROSEC_COMPARE_FORMAT);
+  servo_pulso_actual = us;
 }
 #endif
 
-static void puerta_abrir(void)  { servoUs(SERVO_ABIERTO_US);  puerta_abierta = true;  }
-static void puerta_cerrar(void) { servoUs(SERVO_CERRADO_US);  puerta_abierta = false; }
+static void puerta_abrir(void)
+{
+  if (puerta_abierta) return;
+  servoUs(SERVO_ABIERTO_US);
+  puerta_abierta = true;
+}
 
+static void puerta_cerrar(void)
+{
+  if (!puerta_abierta) return;
+  servoUs(SERVO_CERRADO_US);
+  puerta_abierta = false;
+}
+
+/* ================= SENSORES IR ================= */
 static uint8_t  irCrudo[4], irEst[4];
 static uint32_t irT[4];
-static uint8_t  pisoSensor = 0;
+static uint8_t  pisoSensor = 0;              /* ultimo piso detectado por un sensor (0 = ninguno) */
 
 static uint8_t sensorRaw(uint8_t p)
 {
@@ -223,6 +313,7 @@ static void irLeer(void)
   }
 }
 
+/* ================= LEDs ================= */
 static void leds(bool mov, bool emg)
 {
   static int8_t ult = -1;
@@ -234,12 +325,14 @@ static void leds(bool mov, bool emg)
   digitalWrite(PIN_LED_EMG,    est == 2);
 }
 
-static const uint8_t SEQ[8] = {0x1, 0x3, 0x2, 0x6, 0x4, 0xC, 0x8, 0x9};
+/* ================= MOTOR ================= */
+static const uint8_t SEQ[8] = {0x1, 0x3, 0x2, 0x6, 0x4, 0xC, 0x8, 0x9};  /* medio paso */
 static uint8_t fase = 0;
 
 volatile uint8_t  emergencia = 0;
 volatile uint32_t tEmg = 0;
 
+/* Escribe las bobinas. Devuelve false si la emergencia esta activa (no energiza nada) */
 static bool coils(uint8_t v)
 {
   bool ok;
@@ -258,6 +351,7 @@ static void motor_apagar(void)
   COIL_PORT->BSRR = (0xFUL << (COIL_SHIFT + 16));
 }
 
+/* d = +1 sube, -1 baja (sentido LOGICO). Devuelve true si el paso se dio */
 static bool motor_paso(int8_t d)
 {
   if (emergencia) return false;
@@ -266,16 +360,18 @@ static bool motor_paso(int8_t d)
   return coils(SEQ[fase]);
 }
 
+/* EMERGENCIA: lo primero es apagar las bobinas */
 void emergenciaISR(void)
 {
   motor_apagar();
   uint32_t ahora = millis();
   if ((ahora - tEmg) >= 250UL) {
     tEmg = ahora;
-    emergencia ^= 1;
+    emergencia ^= 1;                 /* 1 = detenido, 0 = liberar */
   }
 }
 
+/* ================= BOTONES (con antirrebote) ================= */
 static bool crudo[3], estable[3], flancoP[3], soltado[3];
 static uint32_t tCambio[3], tPulso[3];
 
@@ -299,7 +395,8 @@ static void botonesLimpiar(void)
   memset(soltado, 0, sizeof(soltado));
 }
 
-static int32_t pos = 0;
+/* ================= POSICION ================= */
+static int32_t pos = 0;              /* pasos desde el arranque (+ = sube) */
 static uint32_t tPaso = 0;
 
 static void avisoEmergencia(void)
@@ -317,7 +414,11 @@ static void avisoEmergencia(void)
 }
 
 #if MODO_SERVO
-
+/* =====================================================================
+   MODO SERVO: calibrar los pulsos de la puerta
+   P1 = menos us | P2 = mas us (mantener). El LCD muestra el pulso actual.
+   Anota el valor para "norte" (ABIERTO) y para "oeste" (CERRADO).
+   ===================================================================== */
 static uint16_t servoPulso = SERVO_ABIERTO_US;
 
 static void servoCal(void)
@@ -341,12 +442,14 @@ static void servoCal(void)
   lcdPoll();
   leds(false, false);
 }
-#endif
+#endif /* MODO_SERVO */
 
 #if !MODO_PRUEBA
-
+/* =====================================================================
+   MODO CALIBRACION DE PASOS
+   ===================================================================== */
 static int32_t marcas[4];
-static uint8_t siguiente = 1;
+static uint8_t siguiente = 1;        /* proximo piso a marcar (1..3), 4 = listo */
 static bool moviendo = false;
 static bool avisoLimite = false;
 static int8_t ultDir = 1;
@@ -456,15 +559,18 @@ static void ui(void)
   }
   lcdPoll();
 }
-#endif
+#endif /* !MODO_PRUEBA */
 
 #if MODO_PRUEBA
-
+/* =====================================================================
+   MODO ASCENSOR: ir a cada piso contando pasos + puerta
+   ===================================================================== */
 enum Estado { E_ESPERA, E_MOVIENDO, E_EMERG, E_LLEGANDO, E_ABRIENDO, E_PUERTA, E_CERRANDO };
 static Estado estado = E_ESPERA;
 static uint8_t llamadas[4] = {0, 0, 0, 0};
-static int8_t  dir = 1;
+static int8_t  dir = 1;                /* sentido de la ultima marcha (+1 sube, -1 baja) */
 static uint8_t destino = 0;
+static uint8_t destinoGuardado = 0;    /* destino interrumpido por una emergencia */
 static int32_t posInicio = 0;
 static uint32_t tEstado = 0;
 
@@ -474,11 +580,26 @@ static uint8_t pisoPorPos(void)
   return 0;
 }
 
-static uint8_t pisoMostrado(void)
+/* true si hay una llamada pendiente a un piso distinto de donde esta la cabina */
+static bool llamadaPendiente(void)
 {
-  return pisoSensor ? pisoSensor : pisoPorPos();
+  uint8_t aqui = pisoPorPos();
+  for (uint8_t p = 1; p <= 3; p++)
+    if (llamadas[p] && p != aqui) return true;
+  return false;
 }
 
+/* Piso que se muestra en el LCD (0 = se imprime "-"):
+   - Al pulsar un boton (llamada pendiente) o mientras se mueve: "Piso -"
+   - Cuando el motor frena: el piso que corresponde a los pasos (pos) */
+static uint8_t pisoMostrado(void)
+{
+  if (estado == E_MOVIENDO) return 0;
+  if ((estado == E_ESPERA || estado == E_CERRANDO) && llamadaPendiente()) return 0;
+  return pisoPorPos();          /* 0 si los pasos no coinciden con ningun piso */
+}
+
+/* Llamada mas cercana POR DELANTE en el sentido dado */
 static uint8_t buscar(int8_t sentido, bool inclusivo)
 {
   if (sentido > 0) {
@@ -491,6 +612,46 @@ static uint8_t buscar(int8_t sentido, bool inclusivo)
   return 0;
 }
 
+/* Piso mas cercano a la posicion actual (por pasos) */
+static uint8_t pisoCercano(void)
+{
+  uint8_t mejor = 1;
+  int32_t md = labs((long)(pos - PASOS_PISO[1]));
+  for (uint8_t p = 2; p <= 3; p++) {
+    int32_t d = labs((long)(pos - PASOS_PISO[p]));
+    if (d < md) { md = d; mejor = p; }
+  }
+  return mejor;
+}
+
+/* Elige el proximo destino:
+   1) Si una emergencia interrumpio un viaje, retoma ese destino.
+   2) Si no, el piso solicitado mas CERCANO (medido en pisos).
+   3) Empate (ej: en piso 2 con llamadas 1 y 3): gana el que siga el sentido
+      de la ultima marcha (dir). */
+static uint8_t elegirDestino(void)
+{
+  if (destinoGuardado) {
+    if (llamadas[destinoGuardado]) return destinoGuardado;
+    destinoGuardado = 0;                 /* ya no esta pendiente */
+  }
+
+  uint8_t ref = pisoCercano();
+  uint8_t mejor = 0, mejorD = 255;
+
+  for (uint8_t p = 1; p <= 3; p++) {
+    if (!llamadas[p] || PASOS_PISO[p] == pos) continue;
+    uint8_t d = (p > ref) ? (p - ref) : (ref - p);
+    int8_t  sentidoP = (p > ref) ? 1 : -1;
+    if (d < mejorD || (d == mejorD && sentidoP == dir)) {
+      mejor = p;
+      mejorD = d;
+    }
+  }
+  return mejor;
+}
+
+/* Rampa: lento al salir y al llegar, rapido en medio */
 static uint32_t periodoRampa(int32_t desde, int32_t hasta)
 {
   int32_t hecho = labs((long)(pos - desde));
@@ -504,13 +665,14 @@ static void prueba(void)
 {
   if (emergencia) {
     if (estado != E_EMERG) {
+      if (estado == E_MOVIENDO) destinoGuardado = destino;   /* recuerda el viaje */
       motor_apagar();
       estado = E_EMERG;
-      llamadas[1] = llamadas[2] = llamadas[3] = 0;
+      /* las llamadas NO se borran: se conservan para reanudar */
     }
     return;
   }
-  if (estado == E_EMERG) estado = E_ESPERA;
+  if (estado == E_EMERG) estado = E_ESPERA;    /* al liberar, vuelve a decidir */
 
   for (uint8_t i = 0; i < 3; i++) {
     if (flancoP[i]) {
@@ -525,18 +687,17 @@ static void prueba(void)
     if (aqui && llamadas[aqui]) {
       llamadas[aqui] = 0;
       lcdMensaje("Ya esta aqui", 1500);
-      if (!puerta_abierta) {
+      if (!puerta_abierta) {                       /* puerta cerrada: la abre */
         puerta_abrir();
         estado = E_ABRIENDO;
         tEstado = millis();
         break;
       }
     }
-    uint8_t d = buscar(dir, false);
-    if (!d) d = buscar(-dir, false);
+    uint8_t d = elegirDestino();
     if (!d) {
 #if PUERTA_ABIERTA_EN_REPOSO
-      if (aqui && !puerta_abierta) {
+      if (aqui && !puerta_abierta) {               /* en reposo en un piso: puerta abierta */
         puerta_abrir();
         estado = E_ABRIENDO;
         tEstado = millis();
@@ -544,7 +705,7 @@ static void prueba(void)
 #endif
       break;
     }
-    if (puerta_abierta) {
+    if (puerta_abierta) {                          /* hay que moverse: primero cierra la puerta */
       puerta_cerrar();
       estado = E_CERRANDO;
       tEstado = millis();
@@ -555,19 +716,20 @@ static void prueba(void)
     posInicio = pos;
     tPaso = micros();
     estado = E_MOVIENDO;
+    destinoGuardado = 0;
     break;
   }
 
   case E_MOVIENDO: {
-    uint8_t meta = buscar(dir, true);
+    uint8_t meta = buscar(dir, true);      /* una llamada intermedia se atiende primero */
     if (!meta) { motor_apagar(); estado = E_ESPERA; break; }
     destino = meta;
-    if (pos == PASOS_PISO[meta]) {
+    if (pos == PASOS_PISO[meta]) {         /* llego por pasos: parar */
       motor_apagar();
       llamadas[meta] = 0;
       Serial.print("LLEGO piso "); Serial.print(meta);
       Serial.print(" | pos = "); Serial.println((long)pos);
-      estado = E_LLEGANDO;
+      estado = E_LLEGANDO;                 /* 1 s despues abre la puerta */
       tEstado = millis();
       break;
     }
@@ -590,7 +752,7 @@ static void prueba(void)
   case E_ABRIENDO:
     if ((millis() - tEstado) >= T_SERVO_MS) {
 #if PUERTA_ABIERTA_EN_REPOSO
-      estado = E_ESPERA;
+      estado = E_ESPERA;                   /* se queda abierta en reposo */
 #else
       estado = E_PUERTA;
       tEstado = millis();
@@ -598,9 +760,9 @@ static void prueba(void)
     }
     break;
 
-  case E_PUERTA: {
+  case E_PUERTA: {                         /* solo si PUERTA_ABIERTA_EN_REPOSO = 0 */
     uint8_t aqui = pisoPorPos();
-    if (aqui) llamadas[aqui] = 0;
+    if (aqui) llamadas[aqui] = 0;          /* ignora re-pulsaciones del mismo piso */
     if ((millis() - tEstado) >= T_PUERTA_ABIERTA_MS) {
       puerta_cerrar();
       estado = E_CERRANDO;
@@ -660,8 +822,9 @@ static void ui(void)
   }
   lcdPoll();
 }
-#endif
+#endif /* MODO_PRUEBA */
 
+/* ================= SETUP / LOOP ================= */
 void setup(void)
 {
   Serial.begin(115200);
@@ -676,16 +839,10 @@ void setup(void)
   pinMode(PIN_LED_EMG, OUTPUT);
   leds(false, false);
 
-  servoInit();
-
-#if !MODO_SERVO
-  delay(800);
-  puerta_cerrar();  delay(1200);
-  puerta_abrir();   delay(1200);
-#endif
+  servoInit();                                   /* arranca con la puerta ABIERTA */
 
   attachInterrupt(digitalPinToInterrupt(PIN_EMG), emergenciaISR, FALLING);
-  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);       /* emergencia: prioridad NVIC 0 */
 
   lcdInit();
   irIniciar();
@@ -700,7 +857,7 @@ void setup(void)
     lcdPoner(0, "MODO CALIBRACION");
     lcdPoner(1, "P1 baja P2 sube");
 #endif
-    for (uint16_t i = 0; i < 80; i++) lcdPoll();
+    for (uint16_t i = 0; i < 80; i++) lcdPoll();   /* dibuja todo el mensaje */
   }
   delay(1500);
 }
